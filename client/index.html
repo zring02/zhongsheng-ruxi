@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI小镇</title>
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/vendor/three/build/three.module.js",
+        "three/addons/": "/vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="viewport">
+      <!-- 顶部 HUD -->
+      <header id="hud" class="hud hidden">
+        <div class="hud-info">
+          <b id="hud-scenario" class="hud-scenario">—</b>
+          <span id="hud-mode" class="hud-mode" title="模式 · 难度">—</span>
+          <span id="hud-clock" class="hud-clock">—</span>
+          <span id="hud-left" class="hud-left">—</span>
+          <span id="hud-storyteller" class="hud-storyteller" title="说书人模型">—</span>
+          <span id="hud-cost" class="hud-cost hidden" title="本局模型花费">—</span>
+        </div>
+        <div class="hud-actions">
+          <button id="btn-pause" class="hud-btn">暂停</button>
+          <button id="btn-follow" class="hud-btn" title="镜头跟随当前角色">回到我身边</button>
+          <button id="btn-observer" class="hud-btn hidden" title="切换观察者 / 玩家视角">观察视角</button>
+          <button id="btn-save" class="hud-btn">存档</button>
+          <a id="btn-export" class="hud-btn hidden" href="/api/game/export" download>导出设定</a>
+          <button id="btn-end" class="hud-btn danger">结束这局</button>
+          <button id="btn-new" class="hud-btn">新的一局</button>
+          <span id="conn" class="dot off" title="连接状态"></span>
+        </div>
+      </header>
+      <div id="status-note" class="status-note hidden"></div>
+
+      <!-- 玩家操作面板 -->
+      <section id="player-panel" class="player-panel hidden">
+        <div class="pp-row pp-target-row">
+          <span class="pp-label">目标</span>
+          <span id="pp-target" class="pp-target">点击场景里的人或居民列表选择</span>
+          <button id="pp-clear-target" class="pp-btn ghost hidden">✕</button>
+          <span id="pp-money" class="pp-money hidden" title="你身上的游戏币"></span>
+          <span class="pp-spacer"></span>
+          <button data-act="approach" class="pp-btn needs-target">走过去</button>
+          <button data-act="whisper" class="pp-btn needs-target">私聊</button>
+          <button data-act="eavesdrop" class="pp-btn needs-target">偷听</button>
+          <button data-act="steal" class="pp-btn needs-target">偷东西</button>
+          <button data-act="give" class="pp-btn needs-target">给东西</button>
+          <button data-act="ask" class="pp-btn needs-target" title="花游戏币托人打听目标对谁的看法">打听</button>
+          <button data-act="pass" class="pp-btn needs-target" title="让跟前的目标把话带给别人">传话</button>
+          <button data-act="letter" class="pp-btn" title="写一封信，揣在身上再交出去">写信</button>
+          <button data-act="read" class="pp-btn hidden" title="拆开手里一封不是写给你的信">拆信</button>
+          <button data-act="wechat" class="pp-btn hidden" title="发微信，不用在跟前">微信</button>
+        </div>
+        <form id="pp-form" class="pp-row pp-say-row">
+          <select id="pp-mode" class="pp-select">
+            <option value="say">说话</option>
+            <option value="whisper">私聊</option>
+            <option value="storyteller">对说书人说</option>
+          </select>
+          <input id="pp-text" class="pp-input" type="text" maxlength="300" placeholder="想说什么…" autocomplete="off" />
+          <button id="pp-send" class="pp-btn primary" type="submit">发送</button>
+        </form>
+        <div class="pp-row pp-move-row">
+          <div class="pp-group" title="也可以用 WASD / 方向键">
+            <button data-act="turn-left" class="pp-btn">← 左转</button>
+            <button data-act="move" class="pp-btn">↑ 前进</button>
+            <button data-act="turn-right" class="pp-btn">→ 右转</button>
+            <button data-act="turn-back" class="pp-btn">↓ 转身</button>
+          </div>
+          <div class="pp-group">
+            <button data-act="break" class="pp-btn">挖</button>
+            <button data-act="place" class="pp-btn">放…</button>
+            <button data-act="take" class="pp-btn chest-btn hidden">箱子取…</button>
+            <button data-act="put" class="pp-btn chest-btn hidden">箱子放…</button>
+          </div>
+          <div id="pp-landmarks" class="pp-group pp-landmarks"></div>
+          <div class="pp-group">
+            <button data-act="emote" class="pp-btn">表情…</button>
+          </div>
+        </div>
+        <div id="pp-status" class="pp-status hidden"></div>
+      </section>
+
+      <!-- 底部对白条：最近一句话；左边留给立绘 -->
+      <div id="dialogue" class="dialogue hidden">
+        <div class="dlg-portrait" data-portrait=""></div>
+        <div class="dlg-body">
+          <div class="dlg-head"><b class="dlg-name"></b> <span class="dlg-kind"></span></div>
+          <p class="dlg-text"></p>
+        </div>
+      </div>
+    </div>
+
+    <aside id="panel">
+      <header>
+        <h1>AI小镇</h1>
+        <div id="panel-sub" class="panel-sub">—</div>
+      </header>
+      <section id="sec-agents" class="collapsible">
+        <h2><button class="sec-toggle" data-target="sec-agents">居民 <span class="count" id="agent-count"></span></button></h2>
+        <ul id="agents" class="agents"></ul>
+      </section>
+      <section id="sec-log" class="grow">
+        <h2>小镇动态
+          <label class="check"><input type="checkbox" id="talk-only" /> 只看对话</label>
+        </h2>
+        <ul id="log" class="log"></ul>
+      </section>
+      <section id="sec-chapters" class="collapsible collapsed">
+        <h2><button class="sec-toggle" data-target="sec-chapters">章回 <span class="count" id="chapter-count"></span></button></h2>
+        <ol id="chapters" class="chapters"></ol>
+      </section>
+    </aside>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+  <div id="popover" class="popover hidden"></div>
+
+  <!-- 开局界面 -->
+  <div id="start" class="overlay hidden">
+    <div class="overlay-card start-card">
+      <header class="overlay-head">
+        <h1>AI小镇 · 开新的一局</h1>
+        <div class="overlay-head-actions">
+          <button id="start-gallery" class="pp-btn">结局图鉴</button>
+          <button id="start-back" class="pp-btn ghost hidden">返回当前一局</button>
+        </div>
+      </header>
+      <div class="start-body">
+        <section class="start-section">
+          <h2>选剧本</h2>
+          <div id="scenario-cards" class="scenario-cards"><div class="muted">加载中…</div></div>
+        </section>
+        <section class="start-section">
+          <h2>模式</h2>
+          <div id="mode-toggle" class="seg">
+            <button data-mode="story" class="on">剧情</button>
+            <button data-mode="sandbox">沙盒</button>
+          </div>
+          <p id="mode-hint" class="muted small"></p>
+        </section>
+        <section class="start-section">
+          <h2>难度</h2>
+          <div id="difficulty-picker" class="role-picker difficulty-picker"></div>
+        </section>
+        <section class="start-section">
+          <h2>你是谁</h2>
+          <div id="role-picker" class="role-picker"></div>
+          <div id="player-fields" class="fields">
+            <label>你的名字 <input id="player-name" type="text" maxlength="20" /></label>
+            <label>你的心愿（可不填）<input id="player-wish" type="text" maxlength="200" /></label>
+          </div>
+        </section>
+        <section id="sandbox-options" class="start-section hidden">
+          <h2>沙盒设定</h2>
+          <div class="fields">
+            <label>自定义设定 <textarea id="sb-text" rows="3" maxlength="2000" placeholder="例如：把整个故事搬到太空站上"></textarea></label>
+            <label>说书人活跃度
+              <select id="sb-activity">
+                <option value="quiet">安静</option>
+                <option value="normal" selected>正常</option>
+                <option value="dramatic">戏多</option>
+              </select>
+            </label>
+            <label>昼夜流速（现实 1 秒 = 游戏多少分钟）<input id="sb-mps" type="number" min="0.1" max="60" step="0.1" value="1" /></label>
+            <label class="check"><input id="sb-away" type="checkbox" /> 玩家离开时世界继续运转</label>
+          </div>
+        </section>
+        <section class="start-section start-go">
+          <button id="start-go" class="pp-btn primary big">开始</button>
+          <span id="start-error" class="error"></span>
+        </section>
+        <section class="start-section">
+          <h2>读取存档</h2>
+          <ul id="saves" class="saves"><li class="muted">加载中…</li></ul>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 结局 -->
+  <div id="ending" class="overlay hidden">
+    <div class="overlay-card ending-card">
+      <header class="overlay-head">
+        <h1 id="ending-title" class="ending-title">结局</h1>
+        <div class="overlay-head-actions">
+          <button id="ending-skip" class="pp-btn ghost">跳过</button>
+          <button id="ending-close" class="pp-btn ghost">关闭</button>
+        </div>
+      </header>
+      <div id="ending-body" class="ending-body"></div>
+      <footer class="overlay-foot">
+        <button id="ending-again" class="pp-btn primary">再来一局</button>
+        <button id="ending-gallery" class="pp-btn">结局图鉴</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 结局图鉴 -->
+  <div id="gallery" class="overlay hidden">
+    <div class="overlay-card gallery-card">
+      <header class="overlay-head">
+        <h1>结局图鉴</h1>
+        <div class="overlay-head-actions">
+          <button id="gallery-close" class="pp-btn ghost">关闭</button>
+        </div>
+      </header>
+      <div id="gallery-list" class="gallery-list"><div class="muted">加载中…</div></div>
+    </div>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

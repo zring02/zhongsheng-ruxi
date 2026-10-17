@@ -1,0 +1,139 @@
+{
+  "_说明": "模型名单。tiers.core 给核心人物（和主角联系最密切的几个人），tiers.extra 给路人，storyteller 给说书人。全部是国产模型的 OpenAI 兼容接口；哪个 key 没填就自动用 mock；路人档一个 key 都没有时先用核心档里能用的模型。改 model 字段即可换具体型号；extraBody 里的字段会原样塞进请求体（DeepSeek 预设已带 thinking.disabled，不用再写）。",
+  "models": {
+    "deepseek-flash": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "label": "DeepSeek V4.1 Flash（关思考）",
+      "price": {
+        "in": 2.16,
+        "cached": 0.0432,
+        "out": 8.64
+      }
+    },
+    "deepseek-pro": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "label": "DeepSeek V4 Pro（关思考；贵三四倍，默认不用，想给说书人用就把 tiers.storyteller 改成 deepseek-pro）",
+      "price": {
+        "in": 9.504,
+        "cached": 0.3168,
+        "out": 28.512
+      }
+    },
+    "doubao-pro": {
+      "provider": "doubao",
+      "model": "doubao-1-5-pro-32k-250115",
+      "label": "豆包 标准版",
+      "price": {
+        "in": 0.8,
+        "cached": 0.16,
+        "out": 2
+      }
+    },
+    "doubao-lite": {
+      "provider": "doubao",
+      "model": "doubao-1-5-lite-32k-250115",
+      "label": "豆包 轻量版",
+      "price": {
+        "in": 0.3,
+        "cached": 0.06,
+        "out": 0.6
+      }
+    },
+    "qwen-plus": {
+      "provider": "qwen",
+      "model": "qwen-plus",
+      "label": "通义千问 Plus",
+      "price": {
+        "in": 0.8,
+        "cached": 0.32,
+        "out": 2
+      }
+    },
+    "qwen-turbo": {
+      "provider": "qwen",
+      "model": "qwen-turbo",
+      "label": "通义千问 Turbo",
+      "price": {
+        "in": 0.3,
+        "cached": 0.12,
+        "out": 0.6
+      }
+    },
+    "kimi": {
+      "provider": "kimi",
+      "model": "moonshot-v1-8k",
+      "label": "Kimi",
+      "price": {
+        "in": 2,
+        "cached": 0.5,
+        "out": 10
+      }
+    },
+    "glm-air": {
+      "provider": "zhipu",
+      "model": "glm-4-air",
+      "label": "智谱 GLM-4-Air",
+      "price": {
+        "in": 0.5,
+        "cached": 0.5,
+        "out": 0.5
+      }
+    },
+    "glm-flash": {
+      "provider": "zhipu",
+      "model": "glm-4-flash",
+      "label": "智谱 GLM-4-Flash",
+      "price": {
+        "in": 0,
+        "cached": 0,
+        "out": 0
+      }
+    },
+    "ollama": {
+      "provider": "ollama",
+      "model": "qwen2.5:7b",
+      "label": "本机 Ollama",
+      "price": {
+        "in": 0,
+        "cached": 0,
+        "out": 0
+      }
+    },
+    "mock": {
+      "provider": "mock",
+      "label": "假模型（不花钱）",
+      "price": {
+        "in": 0,
+        "cached": 0,
+        "out": 0
+      }
+    }
+  },
+  "tiers": {
+    "core": [
+      "deepseek-flash",
+      "doubao-pro",
+      "qwen-plus",
+      "kimi",
+      "glm-air"
+    ],
+    "extra": [
+      "doubao-lite",
+      "qwen-turbo",
+      "glm-flash"
+    ],
+    "storyteller": "deepseek-flash"
+  },
+  "maxTokens": {
+    "core": 220,
+    "extra": 160,
+    "storyteller": 900
+  },
+  "_价格说明": "price 是人民币元 / 百万 token（in 未命中缓存的输入、cached 命中缓存的输入、out 输出）。DeepSeek 按 2026-10 官网美元高峰价 × 7.2 填（北京时间 9–12、14–18 点工作日是高峰，其余时段半价，所以实际账单会更低）；其他家按 2026-10 官网标价粗填，接上真 key 后用实际账单核对。budget 是每局预算（美元）和汇率，花到八成开始省（配角只在有事时才想、核心人物发呆间隔加倍），花完停用真模型改用内置行为。",
+  "budget": {
+    "usdPerMatch": 1,
+    "cnyPerUsd": 7.2
+  }
+}

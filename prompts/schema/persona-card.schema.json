@@ -1,0 +1,255 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AI小镇人设卡",
+  "description": "一张卡 = 一个 AI 角色。除 server_only 外的字段都会拼进这个角色的系统提示词；server_only 永远不进提示词，由服务器保管，条件满足时才放进某一回合的【只有你知道的事】。",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "tier",
+    "identity",
+    "personality",
+    "wish",
+    "speech",
+    "relations",
+    "ooc_reaction"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "角色 id，和剧本 json 的 roles[].id、动作里的 to 一致"
+    },
+    "name": {
+      "type": "string"
+    },
+    "tier": {
+      "enum": [
+        "core",
+        "extra"
+      ],
+      "description": "core=核心六人，用 system.core.md 和好一点的模型；extra=配角，用 system.extra.md 和最便宜的模型"
+    },
+    "identity": {
+      "type": "string",
+      "description": "一句话身份，第二人称不必写“你是”"
+    },
+    "personality": {
+      "type": "string",
+      "description": "性格要点，写具体的行为倾向，不写空洞形容词"
+    },
+    "wish": {
+      "type": "string",
+      "description": "心愿：生活里想要的东西，会随互动改变（运行时可被覆盖）"
+    },
+    "knot": {
+      "type": "string",
+      "description": "心结：放不下的事。core 必填"
+    },
+    "boundaries": {
+      "type": "string",
+      "description": "底线：无论如何不会做的事。保证人设不崩"
+    },
+    "secrets": {
+      "type": "array",
+      "description": "小秘密（每个核心人物约 2 条）：text 进提示词，附“问起就撒谎或岔开、只对【可以说心里话的人】吐露”的规则；knowers（知情人 id）不进提示词，服务器据此知道谣言从谁嘴里来",
+      "items": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "knowers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "speech": {
+      "type": "object",
+      "required": [
+        "style",
+        "sample_lines"
+      ],
+      "properties": {
+        "style": {
+          "type": "string",
+          "description": "语气、句式、称呼别人的方式"
+        },
+        "catchphrases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sample_lines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "3-5 句语气样板，每句 40 字内"
+        },
+        "taboo_words": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "这个角色绝不会用的词（剧本 world 里的通用禁词会自动合并）"
+        }
+      }
+    },
+    "deception": {
+      "type": "string",
+      "description": "这个人会在什么事上撒谎、怎么撒谎。core 必填"
+    },
+    "conflict": {
+      "type": "string",
+      "description": "什么事会惹恼他、他吵架的样子。core 必填"
+    },
+    "relations": {
+      "type": "object",
+      "description": "对其他角色的一贯看法，key 是角色 id。玩家穿成谁，就用对那个角色的看法当初始看法",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "ooc_reaction": {
+      "type": "string",
+      "description": "听到出戏的话、听不懂的新词时，这个人的反应（一句话描述+可选一句台词）"
+    },
+    "examples": {
+      "type": "array",
+      "description": "2-3 个完整回合示例，教模型输出格式、敢说谎、敢顶嘴。input 是情境，output 是那回合应输出的 JSON 对象。可以用 {{player_id}} {{player_name}} 占位",
+      "items": {
+        "type": "object",
+        "required": [
+          "input",
+          "output"
+        ],
+        "properties": {
+          "input": {
+            "type": "string"
+          },
+          "output": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "model_hint": {
+      "type": "string",
+      "description": "建议用哪个档位/品牌，仅供分配模型时参考，不进提示词"
+    },
+    "server_only": {
+      "type": "object",
+      "description": "绝不进提示词",
+      "properties": {
+        "fate": {
+          "type": "string",
+          "description": "原著命运，角色自己不知道"
+        },
+        "foreshadow": {
+          "type": "array",
+          "description": "埋好的伏笔：满足 when 时，服务器把 reveal 放进这个角色某一回合的【只有你知道的事】，并记进因果日志",
+          "items": {
+            "type": "object",
+            "required": [
+              "when",
+              "reveal"
+            ],
+            "properties": {
+              "when": {
+                "type": "string"
+              },
+              "reveal": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "alertness": {
+          "enum": [
+            "low",
+            "mid",
+            "high"
+          ],
+          "description": "警觉，不进提示词。服务器算偷听、偷东西被发现的概率（设计稿概率表里的“对方性格警觉”）"
+        },
+        "grudge": {
+          "enum": [
+            "low",
+            "mid",
+            "high"
+          ],
+          "description": "记仇，不进提示词。服务器算信任掉了以后回升多快"
+        },
+        "major_secrets": {
+          "type": "array",
+          "description": "要紧的秘密（0~1 条）：text 不进提示词，只有 hint 一句心事进；满足 release_when（且达到难度档位的信任门槛）时，服务器把 text 放进回合的【只有你知道的事】",
+          "items": {
+            "type": "object",
+            "required": [
+              "text",
+              "hint",
+              "release_when"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "hint": {
+                "type": "string"
+              },
+              "knowers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "release_when": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "known_secrets": {
+      "type": "array",
+      "description": "知道的别人的秘密，进提示词。配合 discretion 决定会不会传出去",
+      "items": {
+        "type": "object",
+        "required": [
+          "owner",
+          "text"
+        ],
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "秘密是谁的（角色 id）"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "discretion": {
+      "enum": [
+        "low",
+        "mid",
+        "high"
+      ],
+      "description": "嘴严不严，渲染成一句话进提示词：听到的秘密和闲话会不会传出去、传的时候走样多少。core 必填"
+    },
+    "nature_line": {
+      "type": "string",
+      "description": "可选。默认“你是个活生生的人，不是什么程序。”；角色本身不是人时覆盖，比如科幻剧本的站载 AI、玄幻剧本的狐妖"
+    }
+  }
+}

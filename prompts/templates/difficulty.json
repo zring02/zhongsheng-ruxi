@@ -1,0 +1,53 @@
+{
+  "_note": "难度档位。text 一局开始时拼进系统提示词（一局内不变，不影响缓存）；server 下的数值给服务器用，不进提示词。数值来自剧情设计稿“三档难度”表，试玩后再调。",
+  "easy": {
+    "name": "宽厚",
+    "text": "你待人宽厚，不大往坏处想。别人说的话，只要听着有几分道理你就信了；被人哄几句就软了；东西少了、话被人听去了，你也不大留心。只有被骗得很明显时你才会生气，气也消得快。",
+    "server": {
+      "detect_delta": -0.1,
+      "lie_exposure": [
+        "witnessed"
+      ],
+      "minor_secret_trust": 20,
+      "major_secret_trust": 50,
+      "major_needs_private": false,
+      "trust_recovery": "fast"
+    }
+  },
+  "normal": {
+    "name": "寻常",
+    "text": "你和寻常人一样：熟人说的话你多半信，生人说的话你要掂量掂量；前后对不上的话你会追问；东西少了你会想想是谁拿的。被人骗过一回，你会记着。",
+    "server": {
+      "detect_delta": 0,
+      "lie_exposure": [
+        "witnessed",
+        "cross_check",
+        "evidence",
+        "storyteller"
+      ],
+      "minor_secret_trust": 40,
+      "major_secret_trust": 70,
+      "major_needs_private": true,
+      "trust_recovery": "normal"
+    }
+  },
+  "hard": {
+    "name": "精明",
+    "text": "你很精明，不轻易信人。别人说的话你都要掂量他图什么；前后有一点对不上，你就记下来，找机会当面戳穿或者告诉别人；谁平白对你好，你先疑他有所求；东西少了一点、身边有人鬼鬼祟祟，你马上就能觉出来。别人跟你说的事，你会找第三个人旁敲侧击核实一下。",
+    "server": {
+      "detect_delta": 0.1,
+      "lie_exposure": [
+        "witnessed",
+        "cross_check",
+        "evidence",
+        "storyteller",
+        "active_verify"
+      ],
+      "minor_secret_trust": 60,
+      "major_secret_trust": 85,
+      "major_needs_private": true,
+      "major_needs_crisis": true,
+      "trust_recovery": "slow"
+    }
+  }
+}
