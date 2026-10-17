@@ -26,6 +26,8 @@ const PHASES: readonly GamePhase[] = ['morning', 'noon', 'evening', 'night'];
 const PHASE_HOURS: Record<GamePhase, [number, number]> = { morning: [6, 12], noon: [12, 17], evening: [17, 21], night: [21, 30] };
 /** 玩家多久没人搭理，说书人就派一位核心人物过来 */
 const LONELY_MS = 5 * 60_000;
+/** 预算控速：角色决策按预算的这一份匀着花，剩下的留给记忆摘要、章回和结局 */
+const PACE_SHARE = 0.85;
 const TIMELINE_LIMIT = 400;
 /** 回放：每隔多久记一帧位置，最多记多少帧（2 秒一帧，3600 帧 = 2 小时） */
 const REPLAY_FRAME_MS = 2000;
@@ -196,6 +198,8 @@ export class GameSession {
       onUsage: (u) => this.meter.add(u),
       budgetLevel: () => this.meter.level,
       wrapAdapter: this.callLog ? (adapter) => wrap(adapter) : undefined,
+      pacing: () => this.pacing(),
+      usdOf: (u) => this.meter.usdOf(u),
     });
     const stCfg = storytellerConfig(this.catalog);
     const st = resolveAdapter(stCfg);
@@ -296,6 +300,20 @@ export class GameSession {
     }
     const m = Math.floor((hour % 24) * 60);
     return { day: dayIndex, phase, time: `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}` };
+  }
+
+  /**
+   * 预算控速（模拟器按它决定每秒让几个人想事）：留 15% 给记忆摘要、章回和结局，其余按剩下的时间匀着花。
+   * 剧情模式按这局剩下的分钟；沙盒没有尽头，按一小时一份预算算。
+   * 一次决策的钱先按价格表估（约 2800 token 进、七成命中缓存、90 token 出），量到实际的以后用实际的。
+   */
+  private pacing() {
+    const budget = this.meter.budgetUsd;
+    if (!(budget > 0)) return null;
+    const remainingSec = this.mode === 'story' ? (this.minutesLeft ?? 0) * 60 : Math.max(0, 3600 - this.sim.elapsedMs / 1000);
+    const ai = this.sim.agents.find((a) => a.kind === 'ai' && a.config.provider !== 'mock');
+    const estDecideUsd = ai ? this.meter.usdOf({ provider: ai.config.provider, model: ai.config.model, promptTokens: 2800, cachedTokens: 1950, completionTokens: 90 }) : 0;
+    return { remainingUsd: budget * PACE_SHARE - this.meter.usd, remainingSec, estDecideUsd };
   }
 
   get minutesLeft(): number | null {

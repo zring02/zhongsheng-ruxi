@@ -18,9 +18,39 @@ const WHISPER_LEAK_RADIUS = 3;
 const MAX_WAIT_TICKS = 10;
 /** 每个角色两次决策之间的最短间隔的默认值（实际值在构造时读环境变量，见 decisionIntervalMs） */
 const DEFAULT_DECISION_INTERVAL_MS = 2000;
-/** 没事发生时多久想一次：核心人物 ×3，路人 ×6（有事才想，省钱） */
-const IDLE_FACTOR = { core: 3, extra: 6 };
+/**
+ * 调度（省钱，2026-10-17 真模型短局 7 分钟 $0.41 之后改的）：有事才想，按事情急不急分四档，
+ * 离上回合至少隔这么久才能再想（毫秒，按 DECISION_INTERVAL_MS / 2000 缩放）：
+ *  3 玩家找上门：对你说话、悄悄话、给东西、写信、发微信 → 马上回
+ *  2 别的居民点名找你、剧情事件牵涉你、身边有人被抓、托人打听回话、偷听到悄悄话
+ *  1 身边有人说话（不是对你）、有人走到跟前
+ *  0 什么都没发生（发呆）；夜里加倍，路人夜里睡觉
+ */
+type Urgency = 0 | 1 | 2 | 3;
+const MIN_GAP_MS: Record<Urgency, { core: number; extra: number }> = {
+  3: { core: 1500, extra: 1500 },
+  2: { core: 5000, extra: 8000 },
+  1: { core: 20_000, extra: 45_000 },
+  0: { core: 60_000, extra: 150_000 },
+};
+/** 同一处（彼此听得见）同时只让一个人在想；玩家找上门的可以多一个。免得一群人同时开口 */
+const FLOOR = 1;
+/** 全局同时在想的人数上限 */
+const MAX_CONCURRENT = 4;
+/** 两个居民之间来回对话，连着这么多轮以后，对方再点名也只算“身边有人说话”；一分钟没被点名就清零 */
+const CHAIN_LIMIT = 4;
+const CHAIN_RESET_MS = 60_000;
+/** 预算控速的令牌桶：最多攒几次、玩家找上门时最多欠几次、每秒最多几次 */
+const BUCKET_CAP = 4;
+const BUCKET_DEBT = 10;
+const MAX_RATE = 1.2;
+/** 记忆摘要：每个时段（早上/中午/傍晚/夜里）换段时压一次；中途攒到这么多条可以再压一次，再多就用不花钱的规则摘要 */
+const MEMORY_CAP = { core: 30, extra: 20 };
+/** 回合提示词里带几条还没压进摘要的旧事（压缩改成按时段以后，免得角色忘了上一两分钟的事） */
+const RECENT_MEMORY_LINES = 4;
 const DEFAULT_INVENTORY: Record<string, number> = { plank: 4 };
+/** 新角色的调度状态：开局人人有点事（1 档），想过一次以后再按事情排 */
+const FRESH_SCHED = { urgency: 1 as Urgency, aiCall: false, chain: 0, chainAt: 0, midCompacted: false };
 
 export interface BlockChange {
   x: number;
@@ -63,6 +93,10 @@ export interface SimOptions {
   budgetLevel?: () => BudgetLevel;
   /** 给每个角色的适配器套一层（调用记录用）；预算用完换成 mock 时也会套 */
   wrapAdapter?: (adapter: ModelAdapter, config: AgentConfig) => ModelAdapter;
+  /** 预算控速：还能花多少美元、还剩多少秒、按价格表估的一次决策多少钱；不需要控速（没预算）时返回 null */
+  pacing?: () => { remainingUsd: number; remainingSec: number; estDecideUsd: number } | null;
+  /** 一次调用的用量折成美元（量出每次决策实际多少钱） */
+  usdOf?: (u: Usage) => number;
 }
 
 export interface Clock {
@@ -92,6 +126,14 @@ interface Runtime {
   /** 临时换成 mock 期间，真模型的适配器放这儿，到点换回来 */
   realAdapter?: ModelAdapter | null;
   mockUntil?: number;
+  /** 这回合叫醒它的事有多急（见 MIN_GAP_MS） */
+  urgency: Urgency;
+  /** 这回合是不是被别的居民点名叫醒的；连着几轮了、上一轮什么时候（见 CHAIN_LIMIT） */
+  aiCall: boolean;
+  chain: number;
+  chainAt: number;
+  /** 记忆摘要：这个时段里中途用模型压过没有（换时段时清掉） */
+  midCompacted: boolean;
 }
 
 /** 真模型连续失败几次就临时改用内置 mock；多久以后再试真模型 */
@@ -107,8 +149,8 @@ interface QueuedAction {
 
 /**
  * 模拟器：每个角色独立跑 perceive → decide → act 循环。
- * 世界以 10Hz 推进（走路、重力、定时器、动作队列）；AI 角色有事（被搭话、有人走近、剧情事件）就尽快思考，
- * 没事就隔较长时间才想一次；玩家的动作走同一条动作队列。
+ * 世界以 10Hz 推进（走路、重力、定时器、动作队列）；AI 角色按事情急不急排队思考（见 MIN_GAP_MS），
+ * 同一处同时只有一个人在想，全局按剩余预算控速；玩家的动作走同一条动作队列。
  */
 export class Simulation {
   readonly world: VoxelWorld;
@@ -136,6 +178,17 @@ export class Simulation {
   readonly pendingAsks = new Set<string>();
   readonly letters = new Map<string, { from: string; to: string; text: string }>();
   private readonly memoryAdapter: ModelAdapter | null;
+  /** 预算控速：令牌桶（每次决策用一个）、当前每秒发几个（null = 不限速）、量出来的每次决策美元数 */
+  private tokens = BUCKET_CAP;
+  private tokenAt = 0;
+  private rate: number | null = null;
+  private rateAt = 0;
+  private decideUsd = 0;
+  private decideN = 0;
+  /** 记忆摘要按时段：上个 tick 的时段，换段时给每个人记一笔“该压了” */
+  private phaseKey = '';
+  private compactQueue: Runtime[] = [];
+  private compactAt = 0;
 
   constructor(readonly opts: SimOptions) {
     const interval = Number(process.env.DECISION_INTERVAL_MS);
@@ -177,9 +230,10 @@ export class Simulation {
         card,
         wakeReason: '',
         memoryMark: 0,
+        ...FRESH_SCHED,
       });
     }
-    if (opts.player) this.runtimes.push({ state: this.spawn(opts.player, '玩家', 'player'), adapter: null, system: '', heard: [], lastDecisionAt: 0, maxTokens: 0, temperature: 0, card: null, wakeReason: '', memoryMark: 0 });
+    if (opts.player) this.runtimes.push({ state: this.spawn(opts.player, '玩家', 'player'), adapter: null, system: '', heard: [], lastDecisionAt: 0, maxTokens: 0, temperature: 0, card: null, wakeReason: '', memoryMark: 0, ...FRESH_SCHED });
   }
 
   /** 某个角色当前的系统提示词（调试、算 token 用） */
@@ -309,10 +363,28 @@ export class Simulation {
     this.timers.push({ at: this.elapsedMs + ms, fn });
   }
 
-  /** 让某人尽快思考 */
-  wake(agentId: string) {
-    const a = this.agent(agentId);
-    if (a && a.kind === 'ai') a.wake = true;
+  /** 叫醒某人：urgency 是这件事有多急（见 MIN_GAP_MS），fromAi = 别的居民点名找他（来回太多轮会降档） */
+  wake(agentId: string, urgency: Urgency = 2, fromAi = false) {
+    const r = this.runtimes.find((x) => x.state.config.id === agentId);
+    if (r) this.poke(r, urgency, fromAi);
+  }
+
+  private poke(r: Runtime, urgency: Urgency, fromAi = false) {
+    const a = r.state;
+    if (a.kind !== 'ai') return;
+    if (fromAi && urgency === 2) {
+      if (Date.now() - r.chainAt > CHAIN_RESET_MS) r.chain = 0;
+      if (r.chain >= CHAIN_LIMIT) urgency = 1;
+    }
+    if (!a.wake) {
+      r.urgency = 0;
+      r.aiCall = false;
+    }
+    a.wake = true;
+    if (urgency > r.urgency) {
+      r.urgency = urgency;
+      r.aiCall = fromAi && urgency === 2;
+    } else if (urgency === r.urgency && urgency === 2 && !fromAi) r.aiCall = false;
   }
 
   /** 玩家（或别的外部来源）投一个动作进队列 */
@@ -334,6 +406,8 @@ export class Simulation {
     this.applyGravity();
     this.stepPaths(now);
     this.drainQueue(now);
+    const cands: { r: Runtime; u: Urgency; score: number }[] = [];
+    const mePos = this.player?.alive ? this.player.pos : null;
     for (const r of this.runtimes) {
       const a = r.state;
       if (!a.alive) continue;
@@ -342,10 +416,13 @@ export class Simulation {
       if (a.jailedUntil && a.jailedUntil <= now) {
         a.jailedUntil = 0;
         this.emit({ kind: 'notice', t: now, agentId: a.config.id, text: '你被放出来了。' });
-        a.wake = true;
+        this.poke(r, 2);
       }
       if (a.kind !== 'ai' || !r.adapter) continue;
-      if (a.thinking || a.path.length || now < a.busyUntil) continue;
+      // 这回合有多急：被叫醒的按叫醒的档，没人叫但身边有人说过话算 1 档，什么都没有算 0 档
+      const u: Urgency = a.wake ? r.urgency : r.heard.length ? 1 : 0;
+      // 走路时不想事；玩家找上门例外（停下来回话，不让玩家对着背影说半天）
+      if (a.thinking || now < a.busyUntil || (a.path.length && u < 3)) continue;
       // 预算：花到八成，配角没事不想、核心人物发呆间隔加倍；花完，所有人改用 mock（零成本）继续过日子
       const level = this.opts.budgetLevel?.() ?? 'ok';
       if (level === 'over' && (r.adapter.provider !== 'mock' || r.realAdapter)) {
@@ -355,7 +432,7 @@ export class Simulation {
         r.mockUntil = undefined;
         a.providerLabel = `${a.config.provider}→mock(预算)`;
       }
-      if (level === 'saving' && a.config.tier !== 'core' && !a.wake && r.adapter.provider !== 'mock') continue;
+      if (level === 'saving' && a.config.tier !== 'core' && u < 2 && r.adapter.provider !== 'mock') continue;
       // 真模型连续超时/报错后临时用 mock 过渡，冷却期满换回真模型再试（接口排队严重时整局不会卡住）
       if (r.realAdapter && r.mockUntil !== undefined && now >= r.mockUntil && level !== 'over') {
         r.adapter = r.realAdapter;
@@ -365,18 +442,119 @@ export class Simulation {
         a.providerLabel = a.config.provider;
         console.log(`[${a.config.name}] 冷却结束，换回 ${a.config.provider}`);
       }
-      // 夜里大多数人睡了：配角没人叫就不想事（显示睡着），核心人物发呆间隔加倍；有人来搭话照样醒
-      const night = this.clock.phase === 'night' && !a.wake && !a.jailedUntil;
+      // 夜里大多数人睡了：配角没人找就不想事（显示睡着），核心人物没事时间隔加倍；有人来搭话照样醒
+      const night = this.clock.phase === 'night' && u < 2 && !a.jailedUntil;
       if (night && a.config.tier !== 'core') {
         a.emote = 'sleep';
         continue;
       }
-      const idle = this.decisionIntervalMs * IDLE_FACTOR[a.config.tier ?? 'extra'] * (a.jailedUntil ? 2 : 1) * (level === 'saving' ? 2 : 1) * (night ? 2 : 1);
-      const gap = a.wake ? Math.max(this.decisionIntervalMs, 1500) : idle;
+      const tier = a.config.tier === 'core' ? 'core' : 'extra';
+      let gap = MIN_GAP_MS[u][tier] * this.gapScale;
+      if (u < 2) gap *= (a.jailedUntil ? 2 : 1) * (level === 'saving' ? 2 : 1) * (night ? 2 : 1);
       if (now - r.lastDecisionAt < gap) continue;
-      void this.think(r);
+      // 排序：急的先、玩家身边的先（玩家看得见的地方要热闹）、核心人物先、等得久的先
+      const nearPlayer = mePos && cheb(a.pos, mePos) <= HEARING_RADIUS ? 30 : 0;
+      cands.push({ r, u, score: u * 100 + nearPlayer + (tier === 'core' ? 15 : 0) + Math.min(60, (now - r.lastDecisionAt) / 1000) });
     }
+    if (cands.length) this.dispatch(cands, now);
+    this.queueCompactions(now);
     this.flushBlocks();
+  }
+
+  /** 最短间隔按 DECISION_INTERVAL_MS 缩放（默认 2000 = 1 倍；测试时设小可以跑快） */
+  private get gapScale() {
+    return this.decisionIntervalMs / DEFAULT_DECISION_INTERVAL_MS;
+  }
+
+  /** 从排好队的人里挑这一 tick 开始想的：全局最多 MAX_CONCURRENT 个，同一处只一个，按预算拿令牌 */
+  private dispatch(cands: { r: Runtime; u: Urgency; score: number }[], now: number) {
+    this.refill(now);
+    cands.sort((x, y) => y.score - x.score);
+    let busy = this.runtimes.reduce((n, r) => n + (r.state.thinking ? 1 : 0), 0);
+    for (const c of cands) {
+      if (c.u < 3 && busy >= MAX_CONCURRENT) continue;
+      const a = c.r.state;
+      const near = this.runtimes.reduce((n, o) => n + (o !== c.r && o.state.thinking && cheb(o.state.pos, a.pos) <= HEARING_RADIUS ? 1 : 0), 0);
+      if (near >= (c.u === 3 ? FLOOR + 1 : FLOOR)) continue;
+      if (!this.takeToken(c.u === 3)) continue;
+      busy++;
+      if (a.path.length) this.finishPath(a, now, false);
+      void this.think(c.r, c.u);
+    }
+  }
+
+  /** 令牌桶：按剩余预算 ÷ 剩余时间 ÷ 每次决策的钱 补充；每 2 秒重算一次速度 */
+  private refill(now: number) {
+    if (now - this.rateAt >= 2000) {
+      this.rateAt = now;
+      this.rate = this.computeRate();
+    }
+    const dt = this.tokenAt ? Math.min(10, (now - this.tokenAt) / 1000) : 0;
+    this.tokenAt = now;
+    if (this.rate !== null) this.tokens = Math.min(BUCKET_CAP, this.tokens + dt * this.rate);
+  }
+
+  private takeToken(urgent: boolean): boolean {
+    if (this.rate === null) return true;
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return true;
+    }
+    // 玩家找上门的总要回：可以先欠着，之后别人少想几次补回来
+    if (urgent) {
+      this.tokens = Math.max(-BUCKET_DEBT, this.tokens - 1);
+      return true;
+    }
+    return false;
+  }
+
+  /** 每秒能让几个人想：null = 不限速（没预算，或者全是不花钱的 mock） */
+  private computeRate(): number | null {
+    const p = this.opts.pacing?.();
+    if (!p) return null;
+    const per = this.decideN >= 5 ? this.decideUsd : p.estDecideUsd || this.decideUsd;
+    if (!(per > 0)) return null;
+    return Math.min(MAX_RATE, Math.max(0, p.remainingUsd) / Math.max(30, p.remainingSec) / per);
+  }
+
+  /** 当前控速状态（调试、测试用） */
+  pacingInfo() {
+    return { rate: this.rate, tokens: Math.round(this.tokens * 100) / 100, decideUsd: this.decideUsd, decideN: this.decideN };
+  }
+
+  /** 换时段时把每个人排进“该压记忆了”的队，之后每 1.5 秒压一个（不一下子全挤上去） */
+  private queueCompactions(now: number) {
+    const key = `${this.clock.day}-${this.clock.phase}`;
+    if (key !== this.phaseKey) {
+      if (this.phaseKey) for (const r of this.runtimes) if (r.state.kind === 'ai' && r.state.alive && !this.compactQueue.includes(r)) this.compactQueue.push(r);
+      this.phaseKey = key;
+    }
+    if (!this.compactQueue.length || now - this.compactAt < 1500 * this.gapScale) return;
+    const r = this.compactQueue.shift()!;
+    if (r.state.thinking) {
+      this.compactQueue.push(r);
+      return;
+    }
+    this.compactAt = now;
+    r.midCompacted = false;
+    this.compact(r, true);
+  }
+
+  /**
+   * 压一次记忆。useModel=false 或预算用完时用不花钱的规则摘要。
+   * 压缩会从短期记忆前面拿掉一段：【刚发生的事】的起点（memoryMark）跟着往前挪
+   */
+  private compact(r: Runtime, useModel: boolean) {
+    const a = r.state;
+    if (!needsCompaction(a)) return;
+    const over = (this.opts.budgetLevel?.() ?? 'ok') === 'over';
+    // 有专门的便宜模型就用它（带它自己的型号）；否则用角色自己的模型；mock 和预算用完时走规则摘要
+    const own = r.adapter?.provider === 'mock' ? null : r.adapter;
+    const useCheap = !!this.memoryAdapter;
+    const adapter = !useModel || over ? null : useCheap ? this.memoryAdapter : own;
+    const before = a.memory.length;
+    void compactMemory(a, adapter, undefined, this.opts.onUsage, useCheap ? this.opts.memorySpec ?? null : null);
+    r.memoryMark = Math.max(0, r.memoryMark - (before - a.memory.length));
   }
 
   private runTimers() {
@@ -461,7 +639,7 @@ export class Simulation {
         const target = typeof a.faceOnArrive === 'string' ? this.agent(a.faceOnArrive)?.pos : a.faceOnArrive;
         if (target && (target.x !== a.pos.x || target.z !== a.pos.z)) a.facing = facingToward(a.pos, target);
         // 走到人跟前：对方也会注意到你
-        if (typeof a.faceOnArrive === 'string') this.wake(a.faceOnArrive);
+        if (typeof a.faceOnArrive === 'string') this.wake(a.faceOnArrive, a.kind === 'player' ? 2 : 1);
       }
       this.emit({ kind: 'arrive', t: now, agentId: a.config.id, target: a.targetName ?? '' });
     }
@@ -569,11 +747,20 @@ export class Simulation {
   }
 
   /** perceive → decide → 投进动作队列 */
-  private async think(r: Runtime) {
+  private async think(r: Runtime, u: Urgency = 0) {
     const a = r.state;
     a.thinking = true;
     a.wake = false;
     r.lastDecisionAt = Date.now();
+    // 两个居民来回点名：数一数连着几轮了（见 CHAIN_LIMIT）；玩家来找就清零
+    if (u === 3) r.chain = 0;
+    else if (u === 2 && r.aiCall) {
+      if (r.lastDecisionAt - r.chainAt > CHAIN_RESET_MS) r.chain = 0;
+      r.chain++;
+      r.chainAt = r.lastDecisionAt;
+    }
+    r.urgency = 0;
+    r.aiCall = false;
     try {
       const now0 = Date.now();
       const heard = r.heard.splice(0);
@@ -582,7 +769,13 @@ export class Simulation {
       const prompt = r.card && this.opts.promptPack ? buildTurnPrompt(this.opts.promptPack, r.card, this.turnData(r, observation, heard, now0)) : buildUserPrompt(observation);
       r.memoryMark = a.memory.length;
       r.wakeReason = '';
-      const text = await r.adapter!.decide({ agent: a.config, system: r.system, prompt, observation, maxTokens: r.maxTokens, json: true, temperature: r.temperature, onUsage: this.opts.onUsage });
+      const onUsage = (usage: Usage) => {
+        this.opts.onUsage?.(usage);
+        // 量每次决策实际花多少（控速用），滑动平均
+        const usd = this.opts.usdOf?.(usage) ?? 0;
+        if (usd > 0) this.decideUsd = this.decideN++ ? this.decideUsd * 0.9 + usd * 0.1 : usd;
+      };
+      const text = await r.adapter!.decide({ agent: a.config, system: r.system, prompt, observation, maxTokens: r.maxTokens, json: true, temperature: r.temperature, onUsage });
       if (this.frozen) return;
       const parsed = parseDecision(text);
       if (parsed.error !== undefined) {
@@ -616,12 +809,10 @@ export class Simulation {
       this.noteFailure(r);
     } finally {
       a.thinking = false;
-      if (needsCompaction(a)) {
-        const over = (this.opts.budgetLevel?.() ?? 'ok') === 'over';
-        // 有专门的便宜模型就用它（带它自己的型号）；否则用角色自己的模型；mock 和预算用完时走规则摘要
-        const own = r.adapter?.provider === 'mock' ? null : r.adapter;
-        const useCheap = !!this.memoryAdapter;
-        void compactMemory(a, over ? null : useCheap ? this.memoryAdapter : own, undefined, this.opts.onUsage, useCheap ? this.opts.memorySpec ?? null : null);
+      // 记忆摘要平时按时段压（queueCompactions）；中途攒得太多可以再用模型压一次，再多就用规则摘要
+      if (a.memory.length >= MEMORY_CAP[a.config.tier === 'core' ? 'core' : 'extra']) {
+        this.compact(r, !r.midCompacted);
+        r.midCompacted = true;
       }
     }
   }
@@ -670,7 +861,7 @@ export class Simulation {
       place: here ? here.name : closest ? `${closest.name}外头的野地` : '野地里',
       scene: compactScene(obs, extra),
       feelings: feelings || undefined,
-      memory: a.longMemory.join('') || undefined,
+      memory: this.memoryText(r),
       heard,
       events,
       claims,
@@ -679,6 +870,16 @@ export class Simulation {
       private: priv,
       trigger: r.wakeReason || undefined,
     };
+  }
+
+  /** 【你记得的事】：摘要，加上还没压进摘要的最近几条旧事（上回合以前的；摘要按时段才压一次，免得角色忘了刚才的事） */
+  private memoryText(r: Runtime): string | undefined {
+    const a = r.state;
+    const older = a.memory.slice(Math.max(0, r.memoryMark - RECENT_MEMORY_LINES), r.memoryMark).map((l) => {
+      const t = stripStamp(l);
+      return t.length > 40 ? `${t.slice(0, 40)}…` : t;
+    });
+    return [a.longMemory.join(''), older.length ? `刚才：${older.join('；')}` : ''].filter(Boolean).join(' ') || undefined;
   }
 
   /** 【你此刻】：气头上、被关着……更容易说漏嘴 */
@@ -729,7 +930,7 @@ export class Simulation {
     const r = this.runtimes.find((x) => x.state.config.id === agentId);
     if (!r || !r.state.alive) return;
     r.heard.push(line);
-    r.state.wake = true;
+    this.poke(r, 2);
     if (reason) r.wakeReason ||= reason;
   }
 
@@ -771,7 +972,7 @@ export class Simulation {
           const involved = ev.participants?.includes(a.config.id);
           remember(a, stamp(`【发生了一件事】${ev.text}${involved ? '（你牵涉其中）' : ''}`));
           if (involved) {
-            a.wake = true;
+            this.poke(r, 2);
             r.wakeReason = `发生了一件事：${ev.title}`;
           }
         }
@@ -783,6 +984,20 @@ export class Simulation {
     if (!actor) return;
     const name = actor.config.name;
     const line = describe(ev, name, nameOf, this.landmarks);
+    // 玩家找上门的事最急（3 档）；别的居民点名找你是 2 档，来回太多轮会降档（见 poke）
+    const isP = actor.kind === 'player';
+    const direct: Urgency = isP ? 3 : 2;
+    // 玩家对着人堆说话（没点名）：离得最近的两个人接话，其余的人只是听见
+    const answer =
+      ev.kind === 'say' && !ev.to && isP
+        ? new Set(
+            this.agents
+              .filter((o) => o.kind === 'ai' && o.alive && cheb(o.pos, actor.pos) <= 3)
+              .sort((x, y) => cheb(x.pos, actor.pos) - cheb(y.pos, actor.pos))
+              .slice(0, 2)
+              .map((o) => o.config.id),
+          )
+        : null;
     for (const r of this.runtimes) {
       const a = r.state;
       const self = a === actor;
@@ -797,7 +1012,7 @@ export class Simulation {
         case 'notice':
           if (self) {
             remember(a, stamp(ev.text));
-            a.wake = true;
+            this.poke(r, 2);
             r.wakeReason ||= sanitizeText(ev.text, 40);
           }
           break;
@@ -820,13 +1035,13 @@ export class Simulation {
             remember(a, stamp(relayName ? `${name}托我告诉${relayName}: ${said}` : `${name}悄悄对我说: ${said}`));
             r.heard.push(relayName ? `${name}托你告诉${relayName}：「${said}」` : `${name}悄悄对你说：「${said}」`);
             addClaim(a, actor.config.id, said);
-            a.wake = true;
+            this.poke(r, direct, !isP);
             r.wakeReason = relayName ? `${name}托你给${relayName}带话` : `${name}走到你跟前，悄悄跟你说了话`;
           } else if (overheard) {
             const said = sanitizeText(ev.text);
             remember(a, stamp(`我偷听到${name}悄悄对${nameOf(ev.to)}说: ${said}`));
             r.heard.push(`你偷听到${name}低声对${nameOf(ev.to)}说：「${said}」`);
-            a.wake = true;
+            this.poke(r, 2);
             r.wakeReason ||= `你偷听到了${name}的悄悄话`;
           } else if (near(a, actor.pos, WHISPER_LEAK_RADIUS)) {
             // 旁边的人看见你们在说悄悄话，有三成机会听去几个字
@@ -846,7 +1061,7 @@ export class Simulation {
             remember(a, stamp(`${name}发微信给我: ${said}`));
             r.heard.push(`${name}发来微信：「${said}」`);
             addClaim(a, actor.config.id, said);
-            a.wake = true;
+            this.poke(r, direct, !isP);
             r.wakeReason = `${name}给你发了微信`;
           }
           break;
@@ -862,7 +1077,7 @@ export class Simulation {
             r.heard.push(mine ? `你收到一封信，落款是${from}${viaText ? `，${viaText}` : ''}：「${body}」` : `你拆开了${from}写给${toName}的信：「${body}」`);
             if (mine) addClaim(a, ev.from, body);
             a.lastResult = mine ? `收到了${from}的信` : `拆开了${from}写给${toName}的信`;
-            a.wake = true;
+            this.poke(r, ev.from === this.player?.config.id ? 3 : 2);
             r.wakeReason = mine ? `你收到了${from}的信` : '你拆开了一封信';
           }
           break;
@@ -873,7 +1088,7 @@ export class Simulation {
             remember(a, stamp(`我${ev.what === 'steal' ? '偷' : '偷听'}${nameOf(ev.target)}被${nameOf(ev.by)}当场抓住，${ev.penalty}`));
           } else if (near(a, actor.pos, HEARING_RADIUS)) {
             remember(a, stamp(line));
-            a.wake = true;
+            this.poke(r, 2);
             r.wakeReason = line;
           }
           if (self) a.mood = { text: '你刚被人当场抓住，又羞又气', until: ev.t + 180_000 };
@@ -890,9 +1105,13 @@ export class Simulation {
             const toWhom = ev.to === a.config.id ? '对你' : ev.to ? `对${nameOf(ev.to)}` : '';
             r.heard.push(`${name}${toWhom}说：「${said}」`);
             if (ev.to === a.config.id) addClaim(a, actor.config.id, said);
-            if (ev.to === a.config.id || (!ev.to && cheb(a.pos, actor.pos) <= 3)) {
-              a.wake = true;
-              r.wakeReason = ev.to === a.config.id ? `${name}对你说了话` : `${name}在你旁边说话`;
+            // 点名对你说才叫醒你；玩家没点名时离得最近的两个人接话；别的话只是听见（下回合想事时一起看）
+            if (ev.to === a.config.id) {
+              this.poke(r, direct, !isP);
+              r.wakeReason = `${name}对你说了话`;
+            } else if (answer?.has(a.config.id)) {
+              this.poke(r, 3);
+              r.wakeReason = `${name}在你旁边说话`;
             }
           }
           break;
@@ -904,7 +1123,7 @@ export class Simulation {
           } else if (ev.to === a.config.id) {
             remember(a, stamp(`${name}给了我${itemName(ev.item)}×${ev.count}`));
             r.heard.push(`${name}给了你${itemName(ev.item)}×${ev.count}`);
-            a.wake = true;
+            this.poke(r, direct);
             r.wakeReason = `${name}给了你东西`;
           } else if (near(a, actor.pos, HEARING_RADIUS)) remember(a, stamp(line));
           break;
@@ -918,7 +1137,7 @@ export class Simulation {
           } else if (near(a, actor.pos, HEARING_RADIUS)) {
             remember(a, stamp(line));
             if (ev.kind === 'arrive' && cheb(a.pos, actor.pos) <= 2) {
-              a.wake = true;
+              this.poke(r, isP ? 2 : 1);
               r.wakeReason ||= `${name}走到了你跟前`;
             }
           }
@@ -971,6 +1190,7 @@ export class Simulation {
         wish: a.wish,
         inventory: a.inventory,
         trust: Object.fromEntries(Object.entries(a.relations).map(([id, r]) => [id, r.trust])),
+        affection: Object.fromEntries(Object.entries(a.relations).map(([id, r]) => [id, r.affection])),
         stats: a.stats,
       })),
     };

@@ -49,11 +49,21 @@ export class CostMeter {
     return exact?.price ?? entries.find((m) => m.price)?.price ?? DEFAULT_PRICE;
   }
 
-  add(u: Usage) {
+  /** 一次调用多少人民币（不记账） */
+  cnyOf(u: Usage): number {
     const p = this.priceFor(u.provider, u.model);
     const cached = Math.min(u.cachedTokens, u.promptTokens);
     const uncached = Math.max(0, u.promptTokens - cached);
-    const cny = (uncached * p.in + cached * (p.cached ?? p.in) + u.completionTokens * p.out) / 1e6;
+    return (uncached * p.in + cached * (p.cached ?? p.in) + u.completionTokens * p.out) / 1e6;
+  }
+
+  usdOf(u: Usage): number {
+    return this.cnyOf(u) / this.cnyPerUsd;
+  }
+
+  add(u: Usage) {
+    const cached = Math.min(u.cachedTokens, u.promptTokens);
+    const cny = this.cnyOf(u);
     this.calls++;
     this.promptTokens += u.promptTokens;
     this.cachedTokens += cached;

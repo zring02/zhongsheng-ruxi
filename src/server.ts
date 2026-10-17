@@ -243,7 +243,7 @@ function snapshotFor(viewer: string | null) {
   if (viewer === null) return snap;
   return {
     ...snap,
-    agents: snap.agents.map((a) => (a.id === viewer ? a : { ...a, lastThought: '', goal: '', trust: {}, wish: '', eavesdropping: null, inventory: {}, stats: { steals: 0, caught: a.stats.caught, gives: 0, whispers: 0, says: a.stats.says } })),
+    agents: snap.agents.map((a) => (a.id === viewer ? a : { ...a, lastThought: '', goal: '', trust: {}, affection: {}, wish: '', eavesdropping: null, inventory: {}, stats: { steals: 0, caught: a.stats.caught, gives: 0, whispers: 0, says: a.stats.says } })),
   };
 }
 
